@@ -1,61 +1,42 @@
 # atlas/main.py
 
-import os
 import time
 import uuid
 import logging
-from typing import Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from fastapi.exceptions import HTTPException as StarletteHTTPException
 
 from .state import AtlasState
-from .status import build_health
+from .config import Settings
+from .errors import error_payload
+from .modules.registry import load_modules
 
-# ---------- Logging ----------
 logger = logging.getLogger("atlas")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-# ---------- App ----------
-app = FastAPI(
-    title="ATLAS Core",
-    version="0.0.2",
-)
-
+settings = Settings.load()
 state = AtlasState()
 
-def get_api_key() -> Optional[str]:
-    """
-    Reads the server API key from env.
-    """
-    key = os.getenv("ATLAS_API_KEY", "").strip()
-    return key if key else None
+app = FastAPI(title="ATLAS Core", version=settings.version)
 
-def is_health_or_whoami(path: str) -> bool:
-    return path in ("/health", "/whoami")
 
 @app.middleware("http")
 async def atlas_middleware(request: Request, call_next):
-
     start = time.perf_counter()
 
-    # Generate a request ID
     request_id = str(uuid.uuid4())
     request.state.request_id = request_id
 
-    # Count request
+    # count request
     state.mark_request()
 
-    # Auth
-    api_key = get_api_key()
-    if api_key is not None and not is_health_or_whoami(request.url.path):
+    # auth: only enforced if ATLAS_API_KEY is set
+    if settings.api_key is not None and request.url.path not in settings.open_paths:
         provided = request.headers.get("x-atlas-key")
-        if provided != api_key:
+        if provided != settings.api_key:
             latency_ms = int((time.perf_counter() - start) * 1000)
-            # Log the rejected request
             logger.info(
                 "event=request "
                 f"request_id={request_id} "
@@ -67,21 +48,17 @@ async def atlas_middleware(request: Request, call_next):
             )
             return JSONResponse(
                 status_code=401,
-                content={
-                    "error": "unauthorized",
-                    "message": "Missing or invalid X-ATLAS-KEY",
-                    "request_id": request_id,
-                },
+                content=error_payload(
+                    code="unauthorized",
+                    message="Missing or invalid X-ATLAS-KEY",
+                    request_id=request_id,
+                ),
                 headers={"X-Request-ID": request_id},
             )
 
-    # Continue request
     response = await call_next(request)
-
-    # Attach request ID to response headers
     response.headers["X-Request-ID"] = request_id
 
-    # Log success/failure
     latency_ms = int((time.perf_counter() - start) * 1000)
     logger.info(
         "event=request "
@@ -95,20 +72,60 @@ async def atlas_middleware(request: Request, call_next):
 
     return response
 
-@app.get("/health")
-def health():
-    return build_health(state)
 
-@app.get("/whoami")
-def whoami(request: Request):
+# ----- Exception Handling -----
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    request_id = getattr(request.state, "request_id", None)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=error_payload(
+            code="http_error",
+            message=str(exc.detail),
+            request_id=request_id,
+        ),
+        headers={"X-Request-ID": request_id} if request_id else None,
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    request_id = getattr(request.state, "request_id", None)
+
+    logger.info(
+        "event=error "
+        f"request_id={request_id} "
+        f"path={request.url.path} "
+        f"type={type(exc).__name__} "
+        "message=unhandled_exception"
+    )
+
+    return JSONResponse(
+        status_code=500,
+        content=error_payload(
+            code="internal_error",
+            message="Internal server error",
+            request_id=request_id,
+        ),
+        headers={"X-Request-ID": request_id} if request_id else None,
+    )
+
+
+# ----- Module loading -----
+
+_loaded = load_modules(settings.enabled_modules)
+
+for m in _loaded:
+    app.include_router(m.router(state=state, settings=settings))
+
+
+@app.get("/modules")
+def modules():
     return {
-        "client_host": request.client.host if request.client else None,
-        "method": request.method,
-        "path": request.url.path,
-        "user_agent": request.headers.get("user-agent"),
-        "request_id": getattr(request.state, "request_id", None),
+        "enabled_modules": settings.enabled_modules,
+        "loaded_modules": [m.name for m in _loaded],
+        "version": settings.version,
+        "auth_enabled": settings.api_key is not None,
+        "open_paths": settings.open_paths,
     }
-
-@app.get("/protected/ping")
-def protected_ping():
-    return {"ok": True}

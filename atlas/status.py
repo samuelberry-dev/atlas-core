@@ -1,22 +1,16 @@
 # atlas/status.py
 
 from datetime import datetime, timezone
-from typing import Dict, Any
+from typing import Any, Dict
 
 from .state import AtlasState
+from .config import Settings
 
 
-VERSION = "0.0.2"
-
-
-def build_health(state: AtlasState) -> Dict[str, Any]:
-    """
-    Build the health/status response for ATLAS.
-    """
-    
+def build_health(state: AtlasState, *, settings: Settings) -> Dict[str, Any]:
     return {
         "status": "ok",
-        "version": VERSION,
+        "version": settings.version,
         "uptime_seconds": state.uptime_seconds(),
         "server_time": datetime.now(timezone.utc).isoformat(),
         "requests_total": state.requests_total(),
