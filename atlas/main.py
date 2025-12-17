@@ -13,11 +13,18 @@ from .config import Settings
 from .errors import error_payload
 from .modules.registry import load_modules
 
+from pathlib import Path
+from .storage.event_store import EventStore
+
+
 logger = logging.getLogger("atlas")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 settings = Settings.load()
 state = AtlasState()
+
+DATA_DIR = Path("data")
+event_store = EventStore(DATA_DIR / "atlas.db")
 
 app = FastAPI(title="ATLAS Core", version=settings.version)
 
